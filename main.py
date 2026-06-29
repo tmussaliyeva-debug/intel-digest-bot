@@ -4,7 +4,8 @@ import os
 import json
 import logging
 import re
-from datetime import datetime
+import hashlib
+from datetime import datetime, timedelta
 import pytz
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -16,6 +17,8 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
+SEEN_FILE = "/app/seen_news.json"
+
 CHANNELS = {
     "ai": {"emoji": "🤖", "title": "Все новости ИИ", "prompt": "Найди 5 самых актуальных новостей за последние 48 часов по теме 'Искусственный интеллект': новые модели, исследования, продуктовые запуски, регуляция, конкуренция OpenAI/Anthropic/Google/Meta/Mistral, кейсы внедрения ИИ в бизнесе и менеджменте."},
     "merch": {"emoji": "👑", "title": "Premium Merch", "prompt": "Найди 4 актуальных новости за последние 72 часа по теме 'Premium Merch & Brand Experience': лимитированные коллекции, fashion-коллаборации, дизайнерский мерч, luxury merch, creator merch, VIP merch."},
@@ -26,6 +29,49 @@ CHANNELS = {
 }
 
 IMP_LABELS = {"high": "🔴 Важно", "mid": "🟡 Средне", "low": "🔵 Слежу"}
+
+
+def load_seen() -> dict:
+    try:
+        with open(SEEN_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_seen(seen: dict):
+    try:
+        with open(SEEN_FILE, "w") as f:
+            json.dump(seen, f)
+    except Exception as e:
+        logger.error(f"Failed to save seen: {e}")
+
+
+def news_hash(item: dict) -> str:
+    # Hash based on URL + title to detect duplicates
+    key = (item.get("url", "") + item.get("title", "")).lower().strip()
+    return hashlib.md5(key.encode()).hexdigest()
+
+
+def filter_new(items: list, seen: dict) -> list:
+    new_items = []
+    for item in items:
+        h = news_hash(item)
+        if h not in seen:
+            new_items.append(item)
+    return new_items
+
+
+def mark_seen(items: list, seen: dict) -> dict:
+    # Keep seen history for 30 days max
+    cutoff = (datetime.now() - timedelta(days=30)).isoformat()
+    # Clean old entries
+    seen = {k: v for k, v in seen.items() if v > cutoff}
+    # Add new
+    now = datetime.now().isoformat()
+    for item in items:
+        seen[news_hash(item)] = now
+    return seen
 
 
 async def fetch_news(channel_key: str) -> list:
@@ -86,7 +132,7 @@ async def send_telegram(text: str):
             "parse_mode": "Markdown",
             "disable_web_page_preview": True
         })
-        logger.info(f"Telegram: {r.status_code} {r.text[:100]}")
+        logger.info(f"Telegram: {r.status_code}")
 
 
 def format_message(channel_key: str, items: list) -> str:
@@ -107,20 +153,42 @@ def format_message(channel_key: str, items: list) -> str:
 
 async def send_digest():
     logger.info("Starting digest...")
+    seen = load_seen()
     cyprus_tz = pytz.timezone("Asia/Nicosia")
     now = datetime.now(cyprus_tz).strftime("%d.%m.%Y")
-    await send_telegram(f"📋 *Intel Digest — {now}*\nЕжедневная подборка по твоим темам\n━━━━━━━━━━━━━━━━━━━━━━")
+
+    await send_telegram(
+        f"📋 *Intel Digest — {now}*\n"
+        f"Только новые новости\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    total_new = 0
     for ch_key in CHANNELS:
         try:
             logger.info(f"Fetching {ch_key}...")
             items = await fetch_news(ch_key)
-            if items:
-                await send_telegram(format_message(ch_key, items))
+            new_items = filter_new(items, seen)
+            logger.info(f"{ch_key}: {len(items)} total, {len(new_items)} new")
+
+            if new_items:
+                await send_telegram(format_message(ch_key, new_items))
+                seen = mark_seen(new_items, seen)
+                total_new += len(new_items)
                 await asyncio.sleep(2)
+            else:
+                logger.info(f"{ch_key}: no new news, skipping")
         except Exception as e:
             logger.error(f"Error {ch_key}: {e}")
             await send_telegram(f"⚠️ Ошибка *{CHANNELS[ch_key]['title']}*: {str(e)[:100]}")
-    await send_telegram("✅ Дайджест готов. Хорошего дня!")
+
+    save_seen(seen)
+
+    if total_new == 0:
+        await send_telegram("📭 Новых новостей сегодня нет. До завтра!")
+    else:
+        await send_telegram(f"✅ Готово! Новых новостей: {total_new}")
+
     logger.info("Digest sent.")
 
 
@@ -128,10 +196,12 @@ async def main():
     logger.info("Bot starting...")
     if os.environ.get("SEND_ON_START", "false").lower() == "true":
         await send_digest()
+
     scheduler = AsyncIOScheduler(timezone="Asia/Nicosia")
     scheduler.add_job(send_digest, "cron", hour=14, minute=0)
     scheduler.start()
     logger.info("Scheduler started. Waiting for 14:00 Cyprus time...")
+
     while True:
         await asyncio.sleep(60)
 
